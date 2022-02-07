@@ -1,13 +1,25 @@
 use crate::connection::Connection;
 use crate::Result;
 use bytes::Bytes;
-use std::io;
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio_stream::Stream;
 
 /// Established connection with a NATS server.
 pub struct Client {
     connection: Connection,
 }
+
+/// A subscription to one or more subjects
+pub struct Subscription {
+    connection: Connection,
+}
+
+pub struct Message {
+    pub subject: String,
+    pub payload: Bytes,
+}
+
+impl Subscription {}
 
 /// Establish a connection with the NATS server located at `addr`.
 ///
@@ -44,7 +56,21 @@ impl Client {
     /// }
     /// ```
     ///
-    pub async fn publish(&mut self, subject: &str, message: Bytes) -> Result<()> {
-        self.connection.write_publish(subject, message)
+    pub async fn publish(&mut self, subject: &str, payload: Bytes) -> Result<()> {
+        Ok(())
+    }
+
+    /// ```
+    /// use tokio_nats::client;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let mut client = client::connect("localhost:4222").await.unwrap();
+    ///     let mut subscription = client.subscribe("foo").await.unwrap();
+    /// }
+    pub async fn subscribe(self, subject: &str) -> Result<Subscription> {
+        Ok(Subscription {
+            connection: self.connection,
+        })
     }
 }

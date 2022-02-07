@@ -1,6 +1,6 @@
 [workspace]
 
 members = [
-    "tokio-nats",
+    "tokio_nats",
 ]
 
