@@ -57,6 +57,16 @@ to have interior mutability.
 
 Be **very** deliberate with ownership semantics.
 
+
+### No clear error semantics
+
+We're a bit all over the place with errors in the current crate, it's not bad
+but it could perhaps be better.
+
+##### Proposal
+
+Careful consideration when adding new error conditions.
+
 ## Design
 
 The design is up for debate but a few notable runtime agnostic semantics and
