@@ -3,6 +3,9 @@
 This is an experimental playground for a new and improved client
 implementation.
 
+Before we run off implementing it lets get down some design goals, implementing
+it is easy but implementing it right the first time can be tricky.
+
 ## Problems
 
 The implementation has few problems I'd like to solve, including but not
@@ -105,5 +108,3 @@ Some things to consider that have not yet been ironed out:
 
 Unbound channels can grow forever and are most often the slowest kind of
 channel in any implementation.
-
-
