@@ -43,8 +43,8 @@ bare minimum and communicate over channels instead of sharing data.
 
 ## Design
 
-The design is up for debate but a few notable semantics and types include the
-following:
+The design is up for debate but a few notable runtime agnostic semantics and
+types include the following:
 
 ### `nats::Connection`
 
@@ -61,7 +61,7 @@ reference to the connection.
 
 #### Examples
 
-### Subscription
+### `nats::Subscription`
 
 A stream of messages, implements the `Stream` trait.
 
