@@ -64,7 +64,7 @@ types include the following:
 
 ### `nats::Connection`
 
-A framed connection to a server, allows for direct unaltered access at the protocol level.
+A framed connection to a server (otherwise known as a transport), allows for direct unaltered access at the protocol level.
 
 #### Examples
 
