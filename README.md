@@ -70,8 +70,13 @@ A framed connection to a server, allows for direct unaltered access at the proto
 An indirect handle to a connection which allows for the subscription and publication of messages.
 
 This type communicates with connection via channels and does not hold an direct
-reference to the connection.
+reference to the connection but has one indirectly via an internal `Context`
+type which owns the connection.
 
+This context type would also hold a map of channels to subscription `sid`
+as-well.
+
+This type would probably be clonable.
 #### Examples
 
 ### `nats::Subscription`
@@ -86,4 +91,6 @@ the connection nor client.
 ```rust
 let client = nats::connect("localhost:4222").await?;
 let subscription = client.subscribe("foo").await?;
+
+
 ```
