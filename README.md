@@ -43,15 +43,34 @@ bare minimum and communicate over channels instead of sharing data.
 
 ## Design
 
-### Connection
+The design is up for debate but a few notable semantics and types include the
+following:
 
-A framed connection to a server.
+### `nats::Connection`
 
-### Client
+A framed connection to a server, allows for direct unaltered access at the protocol level.
 
-A handle to a connection, which allows subscribing and publishing messages.
+#### Examples
+
+### `nats::Client`
+
+An indirect handle to a connection which allows for the subscription and publication of messages.
+
+This type communicates with connection via channels and does not hold an direct
+reference to the connection.
+
+#### Examples
 
 ### Subscription
 
 A stream of messages, implements the `Stream` trait.
 
+This types communicates via channels and does not hold a direct reference to
+the connection nor client.
+
+#### Examples
+
+```rust
+let client = nats::connect("localhost:4222").await?;
+let subscription = client.subscribe("foo").await?;
+```
