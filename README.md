@@ -108,3 +108,7 @@ Some things to consider that have not yet been ironed out:
 
 Unbound channels can grow forever and are most often the slowest kind of
 channel in any implementation.
+
+### Implicit vs explicit into
+
+Open question on how magical we want conversion to be.
