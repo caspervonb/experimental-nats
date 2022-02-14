@@ -89,8 +89,21 @@ the connection nor client.
 #### Examples
 
 ```rust
-let client = nats::connect("localhost:4222").await?;
-let subscription = client.subscribe("foo").await?;
+let mut client = nats::connect("localhost:4222").await?;
+let mut subscription = client.subscribe("foo").await?;
 
-
+subscription.for_each(async move |message| {
+  println!("Received message {:?}", message);
+}).await;
 ```
+
+## Questions
+
+Some things to consider that have not yet been ironed out:
+
+### Should we continue to use unbounded channels?
+
+Unbound channels can grow forever and are most often the slowest kind of
+channel in any implementation.
+
+
