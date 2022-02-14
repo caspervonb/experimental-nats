@@ -21,7 +21,7 @@ set blocks the entire program.
 
 #### Proposal
 
-First class support for streams and sinks.
+First class support for futures, streams and sinks.
 
 ### Lock contention
 
@@ -40,6 +40,19 @@ We should respect borrow semantics where it makes sense, reduce locks to the
 bare minimum and communicate over channels instead of sharing data.
 
 `Drop` could be implemented as shutdown signals (one shot channels).
+
+
+### No clear ownership semantics 
+
+More or less everything in the crate is `Arc<Mutex>` which leads to the awkward
+situation of no one owns anything.
+
+This is an escape hatch, we shouldn't make it the default thing for all types
+to have interior mutability.
+
+##### Proposal
+
+Be **very** deliberate with ownership semantics.
 
 ## Design
 
