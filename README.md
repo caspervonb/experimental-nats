@@ -11,7 +11,7 @@ it is easy but implementing it right the first time can be tricky.
 The implementation has few problems I'd like to solve, including but not
 limited to the following ones:
 
-## No future
+### No future
 
 As of today, the `nats` crate has no support for futures and therefore no
 support for async/await.
