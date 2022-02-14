@@ -91,6 +91,7 @@ This context type would also hold a map of channels to subscription `sid`
 as-well.
 
 This type would probably be clonable.
+
 #### Examples
 
 ### `nats::Subscription`
