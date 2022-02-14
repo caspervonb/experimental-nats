@@ -3,13 +3,14 @@
 This is an experimental playground for a new and improved client
 implementation.
 
-Before we run off implementing it lets get down some design goals, implementing
+Before we implement this lets get down some design goals, implementing
 it is easy but implementing it right the first time can be tricky.
 
 ## Problems
 
-The implementation has few problems I'd like to solve, including but not
-limited to the following ones:
+The implementation has few problems I'd like to solve, primarily the lock
+contention and lack of parallelism but also including but not limited to the
+following ones:
 
 ### No future
 
