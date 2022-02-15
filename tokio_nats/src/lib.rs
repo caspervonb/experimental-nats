@@ -53,7 +53,6 @@ impl Connection {
 /// The connector takes ownership of the channel.
 pub struct Connector {
     connection: Connection,
-    subscription_senders: Mutex<HashMap<u64, Sender>>,
 }
 
 impl Connector {
@@ -65,6 +64,8 @@ impl Connector {
         loop {
             // ...
         }
+
+        Ok(())
     }
 }
 
