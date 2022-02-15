@@ -53,7 +53,6 @@ impl Connection {
 
 struct Subscription {
     sender: mpsc::Sender<Message>,
-    unsubscribe: oneshot::Receiver<()>,
 }
 
 struct SubscriptionContext {
@@ -67,6 +66,15 @@ impl SubscriptionContext {
             next_id: 0,
             subscription_map: HashMap::new(),
         }
+    }
+
+    pub fn insert(&mut self, subscription: Subscription) -> u64 {
+        let id = self.next_id;
+
+        self.subscription_map.insert(id, subscription);
+        self.next_id = self.next_id + 1;
+
+        id
     }
 }
 
@@ -109,9 +117,13 @@ impl Client {
         Ok(())
     }
 
-    pub async fn subscribe(&mut self, _subject: &str) -> Result<(), io::Error> {
-        let (sender, receiver) = mscp::channel();
-        let subscription_id = self.connector.subscription_context.insert(sender.into());
+    pub async fn subscribe(&mut self, _subject: &str) -> Result<Subscriber, io::Error> {
+        let (sender, receiver) = mpsc::channel(32);
+        let mut subscripton_context = self.connector.subscription_context.lock().unwrap();
+
+        let subscription_id = subscripton_context.insert(Subscription { sender });
+
+        Ok(Subscriber::new(subscription_id, receiver))
     }
 }
 
@@ -135,14 +147,18 @@ pub struct Message {
 }
 
 pub struct Subscriber {
-    messages: mpsc::Receiver<Message>,
-    unsubscribe: oneshot::Sender<()>,
+    sid: u64,
+    receiver: mpsc::Receiver<Message>,
+}
+
+impl Subscriber {
+    fn new(sid: u64, receiver: mpsc::Receiver<Message>) -> Subscriber {
+        Subscriber { sid, receiver }
+    }
 }
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
-        if !self.unsubscribe.is_closed() {
-            self.unsubscribe.send(());
-        }
+        // TODO
     }
 }
