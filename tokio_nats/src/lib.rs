@@ -46,11 +46,34 @@ impl Encoder<ClientFrame> for Codec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: ClientFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        match item {
+            ClientFrame::Publish { subject, payload } => {
+                dst.extend_from_slice(b"PUB ");
+                dst.extend_from_slice(subject.as_bytes());
+                dst.extend_from_slice(format!(" {}\r\n", payload.len()).as_bytes());
+                dst.extend_from_slice(&payload);
+                dst.extend_from_slice(b"\r\n");
+            }
+
+            ClientFrame::Subscribe { sid, subject } => {
+                dst.extend_from_slice(b"SUB ");
+                dst.extend_from_slice(subject.as_bytes());
+                dst.extend_from_slice(format!(" {}\r\n", sid).as_bytes());
+            }
+
+            ClientFrame::Unsubscribe { sid } => {
+                dst.extend_from_slice(b"UNSUB ");
+                dst.extend_from_slice(format!("{}\r\n", sid).as_bytes());
+            }
+        }
+
         Ok(())
     }
 }
 
 /// A framed connection
+///
+/// The type will probably not be public.
 pub struct Connection {
     framed: Framed<TcpStream, Codec>,
 }
@@ -93,6 +116,8 @@ impl SubscriptionContext {
 
 /// A connector which facilitates communication from channels to a single shared connection.
 /// The connector takes ownership of the channel.
+///
+/// The type will probably not be public.
 pub struct Connector {
     connection: Connection,
     // Note: use of std mutex is
