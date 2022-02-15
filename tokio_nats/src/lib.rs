@@ -105,5 +105,7 @@ pub struct Message {
 }
 
 pub struct Subscription {
-    inner: mpsc::Receiver<Message>,
+    message_rx: mpsc::Receiver<Message>,
 }
+
+// impl Stream for Subscription { }
