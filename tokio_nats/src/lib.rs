@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use std::sync::Mutex;
 use tokio::io;
 use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -51,15 +51,40 @@ impl Connection {
     }
 }
 
+struct Subscription {
+    sender: mpsc::Sender<Message>,
+    unsubscribe: oneshot::Receiver<()>,
+}
+
+struct SubscriptionContext {
+    next_id: u64,
+    subscription_map: HashMap<u64, Subscription>,
+}
+
+impl SubscriptionContext {
+    pub fn new() -> SubscriptionContext {
+        SubscriptionContext {
+            next_id: 0,
+            subscription_map: HashMap::new(),
+        }
+    }
+}
+
 /// A connector which facilitates communication from channels to a single shared connection.
 /// The connector takes ownership of the channel.
 pub struct Connector {
     connection: Connection,
+    // Note: use of std mutex is
+    subscription_context: Mutex<SubscriptionContext>,
+    // Locks on individual fields, share the Connector as an Arc rather than an Arc<Mutex>
 }
 
 impl Connector {
     pub fn new(connection: Connection) -> Connector {
-        Connector { connection }
+        Connector {
+            connection,
+            subscription_context: Mutex::new(SubscriptionContext::new()),
+        }
     }
 
     pub async fn run(&self) -> Result<(), io::Error> {
@@ -83,6 +108,11 @@ impl Client {
     pub async fn publish(&mut self, _subject: &str, _bytes: Bytes) -> Result<(), io::Error> {
         Ok(())
     }
+
+    pub async fn subscribe(&mut self, _subject: &str) -> Result<(), io::Error> {
+        let (sender, receiver) = mscp::channel();
+        let subscription_id = self.connector.subscription_context.insert(sender.into());
+    }
 }
 
 pub async fn connect<T: ToSocketAddrs>(addr: T) -> Result<Client, io::Error> {
@@ -104,8 +134,15 @@ pub struct Message {
     payload: Bytes,
 }
 
-pub struct Subscription {
-    message_rx: mpsc::Receiver<Message>,
+pub struct Subscriber {
+    messages: mpsc::Receiver<Message>,
+    unsubscribe: oneshot::Sender<()>,
 }
 
-// impl Stream for Subscription { }
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        if !self.unsubscribe.is_closed() {
+            self.unsubscribe.send(());
+        }
+    }
+}
