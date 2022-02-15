@@ -11,6 +11,19 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
+// FIXME: This is lazy, just for a quick and dirty compile.
+type Error = Box<dyn std::error::Error>;
+
+#[derive(Clone, Debug)]
+pub enum ServerFrame {}
+
+#[derive(Clone, Debug)]
+pub enum ClientFrame {
+    Publish { subject: String, payload: Bytes },
+    Subscribe { sid: u64, subject: String },
+    Unsubscribe { sid: u64 },
+}
+
 /// A codec for encoding and decoding the protocol.
 pub struct Codec {}
 
@@ -29,10 +42,10 @@ impl Decoder for Codec {
     }
 }
 
-impl Encoder<String> for Codec {
+impl Encoder<ClientFrame> for Codec {
     type Error = std::io::Error;
 
-    fn encode(&mut self, item: String, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: ClientFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -70,9 +83,9 @@ impl SubscriptionContext {
 
     pub fn insert(&mut self, subscription: Subscription) -> u64 {
         let id = self.next_id;
+        self.next_id += 1;
 
         self.subscription_map.insert(id, subscription);
-        self.next_id = self.next_id + 1;
 
         id
     }
@@ -84,7 +97,6 @@ pub struct Connector {
     connection: Connection,
     // Note: use of std mutex is
     subscription_context: Mutex<SubscriptionContext>,
-    // Locks on individual fields, share the Connector as an Arc rather than an Arc<Mutex>
 }
 
 impl Connector {
@@ -95,7 +107,7 @@ impl Connector {
         }
     }
 
-    pub async fn run(&self) -> Result<(), io::Error> {
+    pub async fn run(&self, receiver: mpsc::Receiver<ClientFrame>) -> Result<(), io::Error> {
         loop {
             // ...
         }
@@ -105,15 +117,22 @@ impl Connector {
 }
 
 pub struct Client {
+    // TODO; Probably won't have to the connector here (we don't have mut access to it anyway) but
+    // instead just share the subscription context.
     connector: Arc<Connector>,
+    sender: mpsc::Sender<ClientFrame>,
 }
 
 impl Client {
-    pub fn new(connector: Arc<Connector>) -> Client {
-        Client { connector }
+    pub fn new(connector: Arc<Connector>, sender: mpsc::Sender<ClientFrame>) -> Client {
+        Client { connector, sender }
     }
 
-    pub async fn publish(&mut self, _subject: &str, _bytes: Bytes) -> Result<(), io::Error> {
+    pub async fn publish(&mut self, subject: String, payload: Bytes) -> Result<(), Error> {
+        self.sender
+            .send(ClientFrame::Publish { subject, payload })
+            .await?;
+
         Ok(())
     }
 
@@ -131,12 +150,14 @@ pub async fn connect<T: ToSocketAddrs>(addr: T) -> Result<Client, io::Error> {
     let connection = Connection::connect(addr).await?;
     let connector = Arc::new(Connector::new(connection));
 
+    // TODO unbound?
+    let (sender, receiver) = mpsc::channel(32);
     task::spawn({
         let connector = connector.clone();
-        async move { connector.run().await }
+        async move { connector.run(receiver).await }
     });
 
-    let client = Client::new(connector);
+    let client = Client::new(connector, sender);
 
     Ok(client)
 }
@@ -159,6 +180,6 @@ impl Subscriber {
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
-        // TODO
+        // TODO send a unsub over a outgoing channell
     }
 }
