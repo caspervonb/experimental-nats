@@ -3,13 +3,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use futures_util::future::{FutureExt, TryFutureExt};
+use futures_util::select;
+use futures_util::sink::SinkExt;
+use futures_util::stream::StreamExt;
 use std::sync::Mutex;
 use tokio::io;
 use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task;
-use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 // FIXME: This is lazy, just for a quick and dirty compile.
@@ -126,18 +129,37 @@ pub struct Connector {
 }
 
 impl Connector {
-    pub fn new(connection: Connection) -> Connector {
+    pub(crate) fn new(connection: Connection) -> Connector {
         Connector {
             connection,
             subscription_context: Mutex::new(SubscriptionContext::new()),
         }
     }
 
-    pub async fn run(&self, mut receiver: mpsc::Receiver<ClientFrame>) -> Result<(), io::Error> {
+    pub async fn run(
+        &mut self,
+        mut receiver: mpsc::Receiver<ClientFrame>,
+    ) -> Result<(), io::Error> {
         loop {
-            tokio::select! {
-                frame = receiver.recv() => {
-                    self.connection.framed.write(frame).await?
+            select! {
+                maybe_incoming = self.connection.framed.next().fuse() => {
+                    match maybe_incoming {
+                        Some(frame) => {
+                            // ...
+                        },
+                        None => {
+                            // ...
+                        }
+                    }
+                }
+
+                maybe_outgoing = receiver.recv().fuse() => {
+                    match maybe_outgoing {
+                        Some(outgoing) => {
+                            self.connection.framed.send(outgoing).await?
+                        }
+                        None => break,
+                    }
                 }
             }
             // ...
@@ -148,15 +170,19 @@ impl Connector {
 }
 
 pub struct Client {
-    // TODO; Probably won't have to the connector here (we don't have mut access to it anyway) but
-    // instead just share the subscription context.
-    connector: Arc<Connector>,
     sender: mpsc::Sender<ClientFrame>,
+    subscription_context: Arc<Mutex<SubscriptionContext>>,
 }
 
 impl Client {
-    pub fn new(connector: Arc<Connector>, sender: mpsc::Sender<ClientFrame>) -> Client {
-        Client { connector, sender }
+    pub(crate) fn new(
+        sender: mpsc::Sender<ClientFrame>,
+        subscription_context: Arc<Mutex<SubscriptionContext>>,
+    ) -> Client {
+        Client {
+            sender,
+            subscription_context,
+        }
     }
 
     pub async fn publish(&mut self, subject: String, payload: Bytes) -> Result<(), Error> {
@@ -168,8 +194,10 @@ impl Client {
     }
 
     pub async fn subscribe(&mut self, _subject: &str) -> Result<Subscriber, io::Error> {
-        let (sender, receiver) = mpsc::channel(32);
-        let mut subscripton_context = self.connector.subscription_context.lock().unwrap();
+        let (sender, receiver) = mpsc::channel(128);
+
+        // Aiming to make this the only lock (aside from internal locks in channels).
+        let mut subscripton_context = self.subscription_context.lock().unwrap();
 
         let subscription_id = subscripton_context.insert(Subscription { sender });
 
@@ -179,16 +207,14 @@ impl Client {
 
 pub async fn connect<T: ToSocketAddrs>(addr: T) -> Result<Client, io::Error> {
     let connection = Connection::connect(addr).await?;
-    let connector = Arc::new(Connector::new(connection));
+    let subscription_context = Arc::new(Mutex::new(SubscriptionContext::new()));
+    let mut connector = Connector::new(connection);
 
     // TODO unbound?
-    let (sender, receiver) = mpsc::channel(32);
-    task::spawn({
-        let connector = connector.clone();
-        async move { connector.run(receiver).await }
-    });
+    let (sender, receiver) = mpsc::channel(128);
+    let client = Client::new(sender, subscription_context.clone());
 
-    let client = Client::new(connector, sender);
+    task::spawn(async move { connector.run(receiver).await });
 
     Ok(client)
 }
