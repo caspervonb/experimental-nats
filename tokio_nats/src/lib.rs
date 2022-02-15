@@ -9,6 +9,7 @@ use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task;
+use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 // FIXME: This is lazy, just for a quick and dirty compile.
@@ -132,8 +133,13 @@ impl Connector {
         }
     }
 
-    pub async fn run(&self, receiver: mpsc::Receiver<ClientFrame>) -> Result<(), io::Error> {
+    pub async fn run(&self, mut receiver: mpsc::Receiver<ClientFrame>) -> Result<(), io::Error> {
         loop {
+            tokio::select! {
+                frame = receiver.recv() => {
+                    self.connection.framed.write(frame).await?
+                }
+            }
             // ...
         }
 
