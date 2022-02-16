@@ -170,12 +170,12 @@ impl Connector {
                                     // TODO track last pong
                                 },
                                 Err(_) => {
-                                    // TODO
+                                    panic!("The framd stream returned an error");
                                 },
                             }
                         }
                         None => {
-                            // ...
+                            panic!("The framed stream returned none");
                         }
                     }
                 }
@@ -186,6 +186,7 @@ impl Connector {
                             self.connection.framed.send(outgoing).await?
                         }
                         None => {
+                            println!("sender dropped");
                             // Sender dropped, return.
                             break
                         }
