@@ -1,6 +1,9 @@
 /// An extremely minimal barebones draft of the proposed design.
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::BufWriter;
 
@@ -16,7 +19,6 @@ use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::mpsc;
 use tokio::task;
-use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 // FIXME: This is lazy, just for a quick and dirty compile.
 type Error = Box<dyn std::error::Error>;
@@ -36,71 +38,12 @@ pub enum ClientFrame {
     Pong,
 }
 
-/// A codec for encoding and decoding the protocol.
-pub struct Codec {}
-
-impl Codec {
-    fn new() -> Codec {
-        Codec {}
-    }
-}
-
-impl Decoder for Codec {
-    type Item = ServerFrame;
-    type Error = tokio::io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.starts_with(b"PING\r\n") {
-            src.advance(6);
-            return Ok(Some(ServerFrame::Ping));
-        }
-
-        if src.starts_with(b"PONG\r\n") {
-            src.advance(6);
-            return Ok(Some(ServerFrame::Pong));
-        }
-
-        Ok(None)
-    }
-}
-
-impl Encoder<ClientFrame> for Codec {
-    type Error = std::io::Error;
-
-    fn encode(&mut self, item: ClientFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        match item {
-            ClientFrame::Publish { subject, payload } => {
-                dst.extend_from_slice(b"PUB ");
-                dst.extend_from_slice(subject.as_bytes());
-                dst.extend_from_slice(format!(" {}\r\n", payload.len()).as_bytes());
-                dst.extend_from_slice(&payload);
-                dst.extend_from_slice(b"\r\n");
-            }
-
-            ClientFrame::Subscribe { sid, subject } => {
-                dst.extend_from_slice(b"SUB ");
-                dst.extend_from_slice(subject.as_bytes());
-                dst.extend_from_slice(format!(" {}\r\n", sid).as_bytes());
-            }
-
-            ClientFrame::Unsubscribe { sid } => {
-                dst.extend_from_slice(b"UNSUB ");
-                dst.extend_from_slice(format!("{}\r\n", sid).as_bytes());
-            }
-            ClientFrame::Ping => dst.extend_from_slice(b"PING\r\n"),
-            ClientFrame::Pong => dst.extend_from_slice(b"PONG\r\n"),
-        }
-
-        Ok(())
-    }
-}
-
 /// A framed connection
 ///
 /// The type will probably not be public.
 pub struct Connection {
-    framed_write: FramedWrite<BufWriter<OwnedWriteHalf>, Codec>,
-    framed_read: FramedRead<BufReader<OwnedReadHalf>, Codec>,
+    writer: BufWriter<OwnedWriteHalf>,
+    reader: BufReader<OwnedReadHalf>,
 }
 
 impl Connection {
@@ -108,19 +51,48 @@ impl Connection {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(false)?;
 
-        let (reader, writer) = stream.into_split();
-        let framed_write = FramedWrite::new(BufWriter::new(writer), Codec::new());
-        let framed_read = FramedRead::new(BufReader::new(reader), Codec::new());
+        let (read_half, write_half) = stream.into_split();
+        let writer = BufWriter::new(write_half);
+        let reader = BufReader::new(read_half);
 
-        Ok(Connection {
-            framed_write,
-            framed_read,
-        })
+        Ok(Connection { reader, writer })
+    }
+
+    pub async fn write_frame(&mut self, item: &ClientFrame) -> Result<(), Error> {
+        match item {
+            ClientFrame::Publish { subject, payload } => {
+                self.writer.write_all(b"PUB ");
+                self.writer.write_all(b"PUB ");
+                self.writer.write_all(subject.as_bytes());
+                self.writer
+                    .write_all(format!(" {}\r\n", payload.len()).as_bytes());
+                self.writer.write_all(&payload);
+                self.writer.write_all(b"\r\n");
+            }
+
+            ClientFrame::Subscribe { sid, subject } => {
+                self.writer.write_all(b"SUB ");
+                self.writer.write_all(subject.as_bytes());
+                self.writer.write_all(format!(" {}\r\n", sid).as_bytes());
+            }
+
+            ClientFrame::Unsubscribe { sid } => {
+                self.writer.write_all(b"UNSUB ");
+                self.writer.write_all(format!("{}\r\n", sid).as_bytes());
+            }
+            ClientFrame::Ping => {
+                self.writer.write_all(b"PING\r\n");
+            }
+            ClientFrame::Pong => {
+                self.writer.write_all(b"PONG\r\n");
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn publish(&mut self, subject: String, payload: Bytes) -> Result<(), Error> {
-        self.framed_write
-            .send(ClientFrame::Publish { subject, payload })
+        self.write_frame(&ClientFrame::Publish { subject, payload })
             .await?;
 
         Ok(())
@@ -178,35 +150,26 @@ impl Connector {
     ) -> Result<(), io::Error> {
         println!("Start processing");
 
+        let mut line = String::new();
+
         loop {
             select! {
-                maybe_incoming = self.connection.framed_read.next().fuse() => {
-                    match maybe_incoming {
-                        Some(frame) => {
-                            match frame {
-                                Ok(ServerFrame::Ping) => {
-                                   if let Err(err) = self.connection.framed_write.send(ClientFrame::Pong).await {
-                                       println!("Send failed with {:?}", err);
-                                   }
-                                }
-                                Ok(ServerFrame::Pong) => {
-                                    // TODO track last pong
-                                },
-                                Err(_) => {
-                                    println!("The framed stream returned an error");
-                                },
-                            }
+                _ = self.connection.reader.read_line(&mut line).fuse() => {
+                    let op = line
+                        .split_ascii_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_uppercase();
+
+                        if op == "PING" {
+                            self.connection.writer.write_all(b"PONG\r\n").await.unwrap();
                         }
-                        None => {
-                            println!("The framed stream returned none");
-                        }
-                    }
                 }
 
                 maybe_outgoing = receiver.recv().fuse() => {
                     match maybe_outgoing {
                         Some(outgoing) => {
-                            if let Err(err) = self.connection.framed_write.send(outgoing).await {
+                            if let Err(err) = self.connection.write_frame(&outgoing).await {
                                 println!("Send failed with {:?}", err);
                             }
                         }
