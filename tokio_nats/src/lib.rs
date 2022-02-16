@@ -185,6 +185,7 @@ impl Connector {
         }
 
         println!("Graceful shutdown of processing");
+        self.connection.writer.flush().await;
 
         Ok(())
     }
