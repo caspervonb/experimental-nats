@@ -2,8 +2,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
-use futures_util::future::{FutureExt, TryFutureExt};
+use bytes::{Buf, Bytes, BytesMut};
+use futures_util::future::FutureExt;
 use futures_util::select;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use tokio::io;
 use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -19,13 +19,18 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 type Error = Box<dyn std::error::Error>;
 
 #[derive(Clone, Debug)]
-pub enum ServerFrame {}
+pub enum ServerFrame {
+    Ping,
+    Pong,
+}
 
 #[derive(Clone, Debug)]
 pub enum ClientFrame {
     Publish { subject: String, payload: Bytes },
     Subscribe { sid: u64, subject: String },
     Unsubscribe { sid: u64 },
+    Ping,
+    Pong,
 }
 
 /// A codec for encoding and decoding the protocol.
@@ -38,10 +43,20 @@ impl Codec {
 }
 
 impl Decoder for Codec {
-    type Item = String;
+    type Item = ServerFrame;
     type Error = tokio::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.starts_with(b"PING\r\n") {
+            src.advance(6);
+            return Ok(Some(ServerFrame::Ping));
+        }
+
+        if src.starts_with(b"PONG\r\n") {
+            src.advance(6);
+            return Ok(Some(ServerFrame::Pong));
+        }
+
         Ok(None)
     }
 }
@@ -69,6 +84,8 @@ impl Encoder<ClientFrame> for Codec {
                 dst.extend_from_slice(b"UNSUB ");
                 dst.extend_from_slice(format!("{}\r\n", sid).as_bytes());
             }
+            ClientFrame::Ping => dst.extend_from_slice(b"PING\r\n"),
+            ClientFrame::Pong => dst.extend_from_slice(b"PONG\r\n"),
         }
 
         Ok(())
@@ -124,7 +141,7 @@ impl SubscriptionContext {
 /// The type will probably not be public.
 pub struct Connector {
     connection: Connection,
-    // Note: use of std mutex is
+    // Note: use of std mutex is intentional, we never hold this across boundaries.
     subscription_context: Mutex<SubscriptionContext>,
 }
 
@@ -136,7 +153,7 @@ impl Connector {
         }
     }
 
-    pub async fn run(
+    pub async fn process(
         &mut self,
         mut receiver: mpsc::Receiver<ClientFrame>,
     ) -> Result<(), io::Error> {
@@ -145,8 +162,18 @@ impl Connector {
                 maybe_incoming = self.connection.framed.next().fuse() => {
                     match maybe_incoming {
                         Some(frame) => {
-                            // ...
-                        },
+                            match frame {
+                                Ok(ServerFrame::Ping) => {
+                                   self.connection.framed.send(ClientFrame::Pong).await?;
+                                }
+                                Ok(ServerFrame::Pong) => {
+                                    // TODO track last pong
+                                },
+                                Err(_) => {
+                                    // TODO
+                                },
+                            }
+                        }
                         None => {
                             // ...
                         }
@@ -158,7 +185,10 @@ impl Connector {
                         Some(outgoing) => {
                             self.connection.framed.send(outgoing).await?
                         }
-                        None => break,
+                        None => {
+                            // Sender dropped, return.
+                            break
+                        }
                     }
                 }
             }
@@ -214,7 +244,7 @@ pub async fn connect<T: ToSocketAddrs>(addr: T) -> Result<Client, io::Error> {
     let (sender, receiver) = mpsc::channel(128);
     let client = Client::new(sender, subscription_context.clone());
 
-    task::spawn(async move { connector.run(receiver).await });
+    task::spawn(async move { connector.process(receiver).await });
 
     Ok(client)
 }
@@ -237,6 +267,7 @@ impl Subscriber {
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
-        // TODO send a unsub over a outgoing channell
+        // Can we get away with just closing, and then handling that on the sender side?
+        self.receiver.close();
     }
 }
