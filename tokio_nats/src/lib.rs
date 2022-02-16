@@ -1,6 +1,8 @@
 /// An extremely minimal barebones draft of the proposed design.
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::BufReader;
+use tokio::io::BufWriter;
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::future::FutureExt;
@@ -9,11 +11,12 @@ use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::sync::Mutex;
 use tokio::io;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::mpsc;
 use tokio::task;
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 // FIXME: This is lazy, just for a quick and dirty compile.
 type Error = Box<dyn std::error::Error>;
@@ -96,15 +99,31 @@ impl Encoder<ClientFrame> for Codec {
 ///
 /// The type will probably not be public.
 pub struct Connection {
-    framed: Framed<TcpStream, Codec>,
+    framed_write: FramedWrite<BufWriter<OwnedWriteHalf>, Codec>,
+    framed_read: FramedRead<BufReader<OwnedReadHalf>, Codec>,
 }
 
 impl Connection {
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Connection, io::Error> {
         let stream = TcpStream::connect(addr).await?;
-        let framed = Framed::new(stream, Codec::new());
+        stream.set_nodelay(false)?;
 
-        Ok(Connection { framed })
+        let (reader, writer) = stream.into_split();
+        let framed_write = FramedWrite::new(BufWriter::new(writer), Codec::new());
+        let framed_read = FramedRead::new(BufReader::new(reader), Codec::new());
+
+        Ok(Connection {
+            framed_write,
+            framed_read,
+        })
+    }
+
+    pub async fn publish(&mut self, subject: String, payload: Bytes) -> Result<(), Error> {
+        self.framed_write
+            .send(ClientFrame::Publish { subject, payload })
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -161,12 +180,12 @@ impl Connector {
 
         loop {
             select! {
-                maybe_incoming = self.connection.framed.next().fuse() => {
+                maybe_incoming = self.connection.framed_read.next().fuse() => {
                     match maybe_incoming {
                         Some(frame) => {
                             match frame {
                                 Ok(ServerFrame::Ping) => {
-                                   if let Err(err) = self.connection.framed.send(ClientFrame::Pong).await {
+                                   if let Err(err) = self.connection.framed_write.send(ClientFrame::Pong).await {
                                        println!("Send failed with {:?}", err);
                                    }
                                 }
@@ -187,7 +206,7 @@ impl Connector {
                 maybe_outgoing = receiver.recv().fuse() => {
                     match maybe_outgoing {
                         Some(outgoing) => {
-                            if let Err(err) = self.connection.framed.send(outgoing).await {
+                            if let Err(err) = self.connection.framed_write.send(outgoing).await {
                                 println!("Send failed with {:?}", err);
                             }
                         }
