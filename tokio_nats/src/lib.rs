@@ -157,6 +157,8 @@ impl Connector {
         &mut self,
         mut receiver: mpsc::Receiver<ClientFrame>,
     ) -> Result<(), io::Error> {
+        println!("Start processing");
+
         loop {
             select! {
                 maybe_incoming = self.connection.framed.next().fuse() => {
@@ -164,18 +166,20 @@ impl Connector {
                         Some(frame) => {
                             match frame {
                                 Ok(ServerFrame::Ping) => {
-                                   self.connection.framed.send(ClientFrame::Pong).await?;
+                                   if let Err(err) = self.connection.framed.send(ClientFrame::Pong).await {
+                                       println!("Send failed with {:?}", err);
+                                   }
                                 }
                                 Ok(ServerFrame::Pong) => {
                                     // TODO track last pong
                                 },
                                 Err(_) => {
-                                    panic!("The framd stream returned an error");
+                                    println!("The framed stream returned an error");
                                 },
                             }
                         }
                         None => {
-                            panic!("The framed stream returned none");
+                            println!("The framed stream returned none");
                         }
                     }
                 }
@@ -183,10 +187,12 @@ impl Connector {
                 maybe_outgoing = receiver.recv().fuse() => {
                     match maybe_outgoing {
                         Some(outgoing) => {
-                            self.connection.framed.send(outgoing).await?
+                            if let Err(err) = self.connection.framed.send(outgoing).await {
+                                println!("Send failed with {:?}", err);
+                            }
                         }
                         None => {
-                            println!("sender dropped");
+                            println!("Sender closed");
                             // Sender dropped, return.
                             break
                         }
@@ -195,6 +201,8 @@ impl Connector {
             }
             // ...
         }
+
+        println!("Graceful shutdown of processing");
 
         Ok(())
     }
