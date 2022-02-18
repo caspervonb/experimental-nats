@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let now = Instant::now();
     let subject = String::from("foo");
     let dat = Bytes::from("bar");
-    for _ in 0..1_000_000 {
+    for _ in 0..100 {
         client.publish(subject.clone(), dat.clone()).await?;
     }
 

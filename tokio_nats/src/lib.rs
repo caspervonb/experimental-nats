@@ -1,7 +1,7 @@
 use futures_util::stream::Stream;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::pin::Pin;
+use std::str::{self, FromStr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::AsyncReadExt;
@@ -11,17 +11,85 @@ use tokio::io::BufWriter;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::future::FutureExt;
 use futures_util::select;
-use std::sync::Mutex;
 use tokio::io;
 use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::task;
 
 pub type Error = Box<dyn std::error::Error>;
 
+/// Information sent by the server back to this client
+/// during initial connection, and possibly again later.
+#[allow(unused)]
+#[derive(Debug, Default, Clone)]
+pub struct ServerInfo {
+    /// The unique identifier of the NATS server.
+    pub server_id: String,
+    /// Generated Server Name.
+    pub server_name: String,
+    /// The host specified in the cluster parameter/options.
+    pub host: String,
+    /// The port number specified in the cluster parameter/options.
+    pub port: u16,
+    /// The version of the NATS server.
+    pub version: String,
+    /// If this is set, then the server should try to authenticate upon
+    /// connect.
+    pub auth_required: bool,
+    /// If this is set, then the server must authenticate using TLS.
+    pub tls_required: bool,
+    /// Maximum payload size that the server will accept.
+    pub max_payload: usize,
+    /// The protocol version in use.
+    pub proto: i8,
+    /// The server-assigned client ID. This may change during reconnection.
+    pub client_id: u64,
+    /// The version of golang the NATS server was built with.
+    pub go: String,
+    /// The nonce used for nkeys.
+    pub nonce: String,
+    /// A list of server urls that a client can connect to.
+    pub connect_urls: Vec<String>,
+    /// The client IP as known by the server.
+    pub client_ip: String,
+    /// Whether the server supports headers.
+    pub headers: bool,
+    /// Whether server goes into lame duck mode.
+    pub lame_duck_mode: bool,
+}
+
+impl ServerInfo {
+    fn parse(s: &str) -> Option<ServerInfo> {
+        let mut obj = json::parse(s).ok()?;
+        Some(ServerInfo {
+            server_id: obj["server_id"].take_string()?,
+            server_name: obj["server_name"].take_string().unwrap_or_default(),
+            host: obj["host"].take_string()?,
+            port: obj["port"].as_u16()?,
+            version: obj["version"].take_string()?,
+            auth_required: obj["auth_required"].as_bool().unwrap_or(false),
+            tls_required: obj["tls_required"].as_bool().unwrap_or(false),
+            max_payload: obj["max_payload"].as_usize()?,
+            proto: obj["proto"].as_i8()?,
+            client_id: obj["client_id"].as_u64()?,
+            go: obj["go"].take_string()?,
+            nonce: obj["nonce"].take_string().unwrap_or_default(),
+            connect_urls: obj["connect_urls"]
+                .members_mut()
+                .filter_map(|m| m.take_string())
+                .collect(),
+            client_ip: obj["client_ip"].take_string().unwrap_or_default(),
+            headers: obj["headers"].as_bool().unwrap_or(false),
+            lame_duck_mode: obj["ldm"].as_bool().unwrap_or(false),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ServerOp {
+    Info(ServerInfo),
     Ping,
     Pong,
     Message {
@@ -30,6 +98,7 @@ pub enum ServerOp {
         reply_to: Option<String>,
         payload: Bytes,
     },
+    Unknown(String),
 }
 
 #[derive(Clone, Debug)]
@@ -60,57 +129,133 @@ impl Connection {
         })
     }
 
-    pub async fn parse_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
-        println!("try parse: {}", self.buffer.remaining());
-
-        if !self.buffer.has_remaining() {
+    pub fn parse_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
+        if !self.buffer.remaining() < 5 {
             return Ok(None);
         }
 
         fn get_line(buf: &'_ [u8]) -> Option<&'_ [u8]> {
             for i in 0..buf.len() {
                 if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-                    return Some(&buf[0..i]);
+                    return Some(&buf[0..i + 2]);
                 }
             }
 
             None
         }
 
-        match get_line(&self.buffer[..]) {
-            Some(b"PING") => {
-                self.buffer.advance(6);
+        let line = std::str::from_utf8(get_line(&self.buffer[..]).unwrap_or(&[])).unwrap();
+        let line_len = line.len();
 
-                Ok(Some(ServerOp::Ping))
-            }
+        let op = line
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
 
-            Some(b"PONG") => {
-                self.buffer.advance(6);
-
-                Ok(Some(ServerOp::Pong))
-            }
-
-            Some(line) => {
-                println!("LINE_LEN: '{}'", line.len());
-                println!("LINE: '{}'", std::str::from_utf8(line).unwrap());
-
-                if line.starts_with(b"INFO") {
-                    // ...
-                    let offset = line.len() + 2;
-                    self.buffer.advance(offset);
-                }
-
-                Ok(None)
-            }
-
-            None => Ok(None),
+        if op.is_empty() {
+            self.buffer.advance(line_len);
+            return Ok(None);
         }
+
+        if op == "PING" {
+            self.buffer.advance(line_len);
+
+            return Ok(Some(ServerOp::Ping));
+        }
+
+        if op == "PONG" {
+            self.buffer.advance(line_len);
+
+            return Ok(Some(ServerOp::Pong));
+        }
+
+        if op == "INFO" {
+            // Parse the JSON-formatted server information.
+            let server_info = ServerInfo::parse(&line[op.len()..]).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cannot parse server info")
+            })?;
+
+            self.buffer.advance(line_len);
+
+            return Ok(Some(ServerOp::Info(server_info)));
+        }
+
+        if op == "MSG" {
+            // Extract whitespace-delimited arguments that come after "MSG".
+            let args = line[op.len()..]
+                .split_whitespace()
+                .filter(|s| !s.is_empty());
+            let args = args.collect::<Vec<_>>();
+
+            // Parse the operation syntax: MSG <subject> <sid> [reply-to] <#bytes>
+            let (subject, sid, reply_to, payload_len) = match args[..] {
+                [subject, sid, payload_len] => (subject, sid, None, payload_len),
+                [subject, sid, reply_to, payload_len] => {
+                    (subject, sid, Some(reply_to), payload_len)
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid number of arguments after MSG",
+                    ));
+                }
+            };
+
+            // Parse the number of payload bytes.
+            let payload_len = usize::from_str(payload_len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot parse the number of bytes argument after MSG",
+                )
+            })?;
+
+            // Return early if there is not enough remaining bytes to get the payload.
+            if self.buffer.remaining() < line_len + payload_len + 2 {
+                return Ok(None);
+            }
+
+            // Convert the slice into an owned string.
+            let subject = subject.to_owned();
+
+            // Parse the subject ID.
+            let sid = u64::from_str(sid).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot parse sid argument after MSG",
+                )
+            })?;
+
+            // Convert the slice into an owned string.
+            let reply_to = reply_to.map(String::from);
+
+            // Advance the cursor to the start of the payload.
+            self.buffer.advance(line_len);
+
+            // Read the payload.
+            // Note that this is done last to avoid a double borrow.
+            let payload = self.buffer.split_to(payload_len).freeze();
+
+            // Advance past the final "\r\n".
+            self.buffer.advance(2);
+
+            return Ok(Some(ServerOp::Message {
+                subject: subject.to_owned(),
+                sid,
+                reply_to,
+                payload,
+            }));
+        }
+
+        // Unknown
+        self.buffer.advance(line_len);
+
+        Ok(None)
     }
 
     pub async fn read_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
         loop {
-            if let Some(op) = self.parse_op().await? {
-                println!("READ OP: {:?}", op);
+            if let Some(op) = self.parse_op()? {
                 return Ok(Some(op));
             }
 
@@ -125,7 +270,6 @@ impl Connection {
     }
 
     pub async fn write_op(&mut self, item: &ClientOp) -> Result<(), io::Error> {
-        println!("WRITE_OP: '{:?}'", item);
         match item {
             ClientOp::Publish { subject, payload } => {
                 self.stream.write_all(b"PUB ").await?;
@@ -164,30 +308,36 @@ impl Connection {
     }
 }
 
+#[derive(Debug)]
 struct Subscription {
     sender: mpsc::Sender<Message>,
 }
 
+#[derive(Debug)]
 struct SubscriptionContext {
-    next_id: u64,
+    next_sid: u64,
     subscription_map: HashMap<u64, Subscription>,
 }
 
 impl SubscriptionContext {
     pub fn new() -> SubscriptionContext {
         SubscriptionContext {
-            next_id: 0,
+            next_sid: 1,
             subscription_map: HashMap::new(),
         }
     }
 
+    pub fn get(&mut self, sid: u64) -> Option<&Subscription> {
+        self.subscription_map.get(&sid)
+    }
+
     pub fn insert(&mut self, subscription: Subscription) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
+        let sid = self.next_sid;
+        self.next_sid += 1;
 
-        self.subscription_map.insert(id, subscription);
+        self.subscription_map.insert(sid, subscription);
 
-        id
+        sid
     }
 }
 
@@ -198,14 +348,17 @@ impl SubscriptionContext {
 pub struct Connector {
     connection: Connection,
     // Note: use of std mutex is intentional, we never hold this across boundaries.
-    subscription_context: Mutex<SubscriptionContext>,
+    subscription_context: Arc<Mutex<SubscriptionContext>>,
 }
 
 impl Connector {
-    pub(crate) fn new(connection: Connection) -> Connector {
+    pub(crate) fn new(
+        connection: Connection,
+        subscription_context: Arc<Mutex<SubscriptionContext>>,
+    ) -> Connector {
         Connector {
             connection,
-            subscription_context: Mutex::new(SubscriptionContext::new()),
+            subscription_context,
         }
     }
 
@@ -214,7 +367,6 @@ impl Connector {
         mut receiver: mpsc::Receiver<ClientOp>,
     ) -> Result<(), io::Error> {
         loop {
-            println!("loop");
             select! {
                 maybe_op = receiver.recv().fuse() => {
                     match maybe_op {
@@ -231,14 +383,29 @@ impl Connector {
                     }
                 }
 
-                // TODO: make this internally stateful.
                 result = self.connection.read_op().fuse() => {
                     if let Ok(maybe_op) = result {
-                        println!("{:?}", maybe_op);
                         match maybe_op {
                             Some(ServerOp::Ping) => {
                                 self.connection.write_op(&ClientOp::Pong).await?;
                             }
+                            Some(ServerOp::Message { sid, subject, reply_to, payload }) => {
+                                let mut context = self.subscription_context.lock().await;
+                                if let Some(subscription) = context.get(sid) {
+                                    let message = Message {
+                                        subject,
+                                        reply_to ,
+                                        payload,
+                                    };
+
+                                    subscription.sender.send(message).await.unwrap();
+                                }
+                            }
+
+                            None => {
+                                return Ok(())
+                            }
+
                             _ => {
                                 // ignore.
                             }
@@ -249,8 +416,7 @@ impl Connector {
             // ...
         }
 
-        println!("Graceful shutdown of processing");
-        self.connection.stream.flush().await;
+        self.connection.stream.flush().await?;
 
         Ok(())
     }
@@ -284,7 +450,7 @@ impl Client {
         let (sender, receiver) = mpsc::channel(16);
 
         // Aiming to make this the only lock (aside from internal locks in channels).
-        let mut context = self.subscription_context.lock().unwrap();
+        let mut context = self.subscription_context.lock().await;
         let sid = context.insert(Subscription { sender });
 
         self.sender
@@ -302,11 +468,23 @@ pub async fn connect<T: ToSocketAddrs>(addr: T) -> Result<Client, io::Error> {
     connection.stream.write_all(b"PING\r\n").await?;
 
     let subscription_context = Arc::new(Mutex::new(SubscriptionContext::new()));
-    let mut connector = Connector::new(connection);
+    let mut connector = Connector::new(connection, subscription_context.clone());
 
     // TODO unbound?
     let (sender, receiver) = mpsc::channel(128);
-    let client = Client::new(sender, subscription_context.clone());
+    let client = Client::new(sender.clone(), subscription_context.clone());
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            match sender.send(ClientOp::Ping).await {
+                Ok(()) => {}
+                Err(_) => {
+                    return;
+                }
+            }
+        }
+    });
 
     task::spawn(async move { connector.process(receiver).await });
 
@@ -316,6 +494,7 @@ pub async fn connect<T: ToSocketAddrs>(addr: T) -> Result<Client, io::Error> {
 #[derive(Debug)]
 pub struct Message {
     subject: String,
+    reply_to: Option<String>,
     payload: Bytes,
 }
 

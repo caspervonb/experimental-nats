@@ -7,11 +7,10 @@ use std::time::Instant;
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut client = tokio_nats::connect("localhost:4222").await?;
 
-    client.publish("foo".into(), "bar".into()).await?;
-
     let now = Instant::now();
     let mut subscriber = client.subscribe("foo".into()).await.unwrap();
-    client.publish("foo".into(), "hello".into()).await?;
+
+    println!("Awaiting messages");
     while let Some(message) = subscriber.next().await {
         println!("Received message {:?}", message);
     }
