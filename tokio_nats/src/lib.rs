@@ -23,8 +23,7 @@ use tokio::net::ToSocketAddrs;
 use tokio::sync::mpsc;
 use tokio::task;
 
-// FIXME: This is lazy, just for a quick and dirty compile.
-type Error = Box<dyn std::error::Error>;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub enum ServerOp {
@@ -53,101 +52,43 @@ pub enum ClientOp {
 pub struct Connection {
     writer: BufWriter<OwnedWriteHalf>,
     reader: BufReader<OwnedReadHalf>,
+    buffer: BytesMut,
 }
 
 impl Connection {
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Connection, io::Error> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
+        let tcp_stream = TcpStream::connect(addr).await?;
+        tcp_stream.set_nodelay(true)?;
 
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = tcp_stream.into_split();
         let writer = BufWriter::new(write_half);
         let reader = BufReader::new(read_half);
 
-        Ok(Connection { reader, writer })
+        Ok(Connection {
+            reader,
+            writer,
+            buffer: BytesMut::new(),
+        })
     }
 
-    pub async fn read_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
-        // Quick and dirty port from nats.rs
-        // Lots of room for improvement here.
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-
-        let keyword = line
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-
-        if keyword == "PING" {
-            return Ok(Some(ServerOp::Ping));
-        }
-
-        if keyword == "PONG" {
-            return Ok(Some(ServerOp::Pong));
-        }
-
-        if keyword == "MSG" {
-            // FIXME: Copied from nats.rs but this is pretty bad with the extra allocations.
-            // Extract whitespace-delimited arguments that come after "MSG".
-            let args = line["MSG".len()..]
-                .split_whitespace()
-                .filter(|s| !s.is_empty());
-            let args = args.collect::<Vec<_>>();
-
-            // Parse the operation syntax: MSG <subject> <sid> [reply-to] <#bytes>
-            let (subject, sid, reply_to, num_bytes) = match args[..] {
-                [subject, sid, num_bytes] => (subject, sid, None, num_bytes),
-                [subject, sid, reply_to, num_bytes] => (subject, sid, Some(reply_to), num_bytes),
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "invalid number of arguments after MSG",
-                    ));
-                }
-            };
-
-            // Convert the slice into an owned string.
-            let subject = subject.to_owned();
-
-            // Parse the subject ID.
-            let sid = u64::from_str(sid).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot parse sid argument after MSG",
-                )
-            })?;
-
-            // Convert the slice into an owned string.
-            let reply_to = reply_to.map(String::from);
-
-            // Parse the number of payload bytes.
-            let num_bytes = u32::from_str(num_bytes).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot parse the number of bytes argument after MSG",
-                )
-            })?;
-
-            // Read the payload.
-            let mut payload = Vec::new();
-            payload.resize(num_bytes as usize, 0_u8);
-            self.reader.read_exact(&mut payload[..]).await?;
-            // Read "\r\n".
-            self.reader.read_exact(&mut [0_u8; 2]).await?;
-
-            return Ok(Some(ServerOp::Message {
-                subject,
-                sid,
-                reply_to,
-                payload: Bytes::from(payload),
-            }));
-        }
-
+    pub async fn parse_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
         Ok(None)
+    }
+
+    pub async fn read_op(&mut self) -> Result<Option<ServerOp>, Error> {
+        loop {
+            if let Some(frame) = self.parse_op().await? {
+                return Ok(Some(frame));
+            }
+
+            if 0 == self.reader.read_buf(&mut self.buffer).await? {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Err("connection reset by peer".into());
+                }
+            }
+        }
     }
 
     pub async fn write_op(&mut self, item: &ClientOp) -> Result<(), Error> {
