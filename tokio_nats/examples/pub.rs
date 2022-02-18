@@ -8,8 +8,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut client = tokio_nats::connect("localhost:4222").await?;
 
     let now = Instant::now();
-    let subject = String::from("events.data");
-    let dat = Bytes::from("foo");
+    let subject = String::from("foo");
+    let dat = Bytes::from("bar");
     for _ in 0..1_000_000 {
         client.publish(subject.clone(), dat.clone()).await?;
     }

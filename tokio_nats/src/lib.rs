@@ -1,29 +1,24 @@
 use futures_util::stream::Stream;
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::Cursor;
 use std::pin::Pin;
-use std::str::{self, FromStr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
 use tokio::io::BufWriter;
-use tokio::sync::mpsc::Receiver;
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::future::FutureExt;
 use futures_util::select;
 use std::sync::Mutex;
 use tokio::io;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::net::ToSocketAddrs;
 use tokio::sync::mpsc;
 use tokio::task;
 
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Error = Box<dyn std::error::Error>;
 
 #[derive(Clone, Debug)]
 pub enum ServerOp {
@@ -50,8 +45,7 @@ pub enum ClientOp {
 ///
 /// The type will probably not be public.
 pub struct Connection {
-    writer: BufWriter<OwnedWriteHalf>,
-    reader: BufReader<OwnedReadHalf>,
+    stream: BufWriter<TcpStream>,
     buffer: BytesMut,
 }
 
@@ -60,68 +54,109 @@ impl Connection {
         let tcp_stream = TcpStream::connect(addr).await?;
         tcp_stream.set_nodelay(true)?;
 
-        let (read_half, write_half) = tcp_stream.into_split();
-        let writer = BufWriter::new(write_half);
-        let reader = BufReader::new(read_half);
-
         Ok(Connection {
-            reader,
-            writer,
+            stream: BufWriter::new(tcp_stream),
             buffer: BytesMut::new(),
         })
     }
 
     pub async fn parse_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
-        Ok(None)
-    }
+        println!("try parse: {}", self.buffer.remaining());
 
-    pub async fn read_op(&mut self) -> Result<Option<ServerOp>, Error> {
-        loop {
-            if let Some(frame) = self.parse_op().await? {
-                return Ok(Some(frame));
+        if !self.buffer.has_remaining() {
+            return Ok(None);
+        }
+
+        fn get_line(buf: &'_ [u8]) -> Option<&'_ [u8]> {
+            for i in 0..buf.len() {
+                if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+                    return Some(&buf[0..i]);
+                }
             }
 
-            if 0 == self.reader.read_buf(&mut self.buffer).await? {
+            None
+        }
+
+        match get_line(&self.buffer[..]) {
+            Some(b"PING") => {
+                self.buffer.advance(6);
+
+                Ok(Some(ServerOp::Ping))
+            }
+
+            Some(b"PONG") => {
+                self.buffer.advance(6);
+
+                Ok(Some(ServerOp::Pong))
+            }
+
+            Some(line) => {
+                println!("LINE_LEN: '{}'", line.len());
+                println!("LINE: '{}'", std::str::from_utf8(line).unwrap());
+
+                if line.starts_with(b"INFO") {
+                    // ...
+                    let offset = line.len() + 2;
+                    self.buffer.advance(offset);
+                }
+
+                Ok(None)
+            }
+
+            None => Ok(None),
+        }
+    }
+
+    pub async fn read_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
+        loop {
+            if let Some(op) = self.parse_op().await? {
+                println!("READ OP: {:?}", op);
+                return Ok(Some(op));
+            }
+
+            if 0 == self.stream.read_buf(&mut self.buffer).await? {
                 if self.buffer.is_empty() {
                     return Ok(None);
                 } else {
-                    return Err("connection reset by peer".into());
+                    return Err(io::Error::new(io::ErrorKind::ConnectionReset, ""));
                 }
             }
         }
     }
 
-    pub async fn write_op(&mut self, item: &ClientOp) -> Result<(), Error> {
+    pub async fn write_op(&mut self, item: &ClientOp) -> Result<(), io::Error> {
+        println!("WRITE_OP: '{:?}'", item);
         match item {
             ClientOp::Publish { subject, payload } => {
-                self.writer.write_all(b"PUB ").await?;
-                self.writer.write_all(subject.as_bytes()).await?;
-                self.writer
+                self.stream.write_all(b"PUB ").await?;
+                self.stream.write_all(subject.as_bytes()).await?;
+                self.stream
                     .write_all(format!(" {}\r\n", payload.len()).as_bytes())
                     .await?;
-                self.writer.write_all(payload).await?;
-                self.writer.write_all(b"\r\n").await?;
+                self.stream.write_all(payload).await?;
+                self.stream.write_all(b"\r\n").await?;
             }
 
             ClientOp::Subscribe { sid, subject } => {
-                self.writer.write_all(b"SUB ").await?;
-                self.writer.write_all(subject.as_bytes()).await?;
-                self.writer
+                self.stream.write_all(b"SUB ").await?;
+                self.stream.write_all(subject.as_bytes()).await?;
+                self.stream
                     .write_all(format!(" {}\r\n", sid).as_bytes())
                     .await?;
+                self.stream.flush().await?;
             }
 
             ClientOp::Unsubscribe { sid } => {
-                self.writer.write_all(b"UNSUB ").await?;
-                self.writer
+                self.stream.write_all(b"UNSUB ").await?;
+                self.stream
                     .write_all(format!("{}\r\n", sid).as_bytes())
                     .await?;
             }
             ClientOp::Ping => {
-                self.writer.write_all(b"PING\r\n").await?;
+                self.stream.write_all(b"PING\r\n").await?;
             }
             ClientOp::Pong => {
-                self.writer.write_all(b"PONG\r\n").await?;
+                self.stream.write_all(b"PONG\r\n").await?;
             }
         }
 
@@ -179,11 +214,12 @@ impl Connector {
         mut receiver: mpsc::Receiver<ClientOp>,
     ) -> Result<(), io::Error> {
         loop {
+            println!("loop");
             select! {
-                maybe_outgoing = receiver.recv().fuse() => {
-                    match maybe_outgoing {
-                        Some(outgoing) => {
-                            if let Err(err) = self.connection.write_op(&outgoing).await {
+                maybe_op = receiver.recv().fuse() => {
+                    match maybe_op {
+                        Some(op) => {
+                            if let Err(err) = self.connection.write_op(&op).await {
                                 println!("Send failed with {:?}", err);
                             }
                         }
@@ -196,15 +232,25 @@ impl Connector {
                 }
 
                 // TODO: make this internally stateful.
-                maybe_client_op = self.connection.read_op().fuse() => {
-                    println!("{:?}", maybe_client_op);
+                result = self.connection.read_op().fuse() => {
+                    if let Ok(maybe_op) = result {
+                        println!("{:?}", maybe_op);
+                        match maybe_op {
+                            Some(ServerOp::Ping) => {
+                                self.connection.write_op(&ClientOp::Pong).await?;
+                            }
+                            _ => {
+                                // ignore.
+                            }
+                        }
+                    }
                 }
             }
             // ...
         }
 
         println!("Graceful shutdown of processing");
-        self.connection.writer.flush().await;
+        self.connection.stream.flush().await;
 
         Ok(())
     }
@@ -252,7 +298,8 @@ impl Client {
 
 pub async fn connect<T: ToSocketAddrs>(addr: T) -> Result<Client, io::Error> {
     let mut connection = Connection::connect(addr).await?;
-    connection.writer.write_all(b"CONNECT { \"no_responders\": true, \"headers\": true, \"verbose\": false, \"pedantic\": false }\r\n").await?;
+    connection.stream.write_all(b"CONNECT { \"no_responders\": true, \"headers\": true, \"verbose\": false, \"pedantic\": false }\r\n").await?;
+    connection.stream.write_all(b"PING\r\n").await?;
 
     let subscription_context = Arc::new(Mutex::new(SubscriptionContext::new()));
     let mut connector = Connector::new(connection);
