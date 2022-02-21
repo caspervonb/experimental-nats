@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::str::{self, FromStr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use subslice::SubsliceExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
@@ -89,6 +90,7 @@ impl ServerInfo {
 
 #[derive(Clone, Debug)]
 pub enum ServerOp {
+    Ok,
     Info(ServerInfo),
     Ping,
     Pong,
@@ -98,7 +100,6 @@ pub enum ServerOp {
         reply_to: Option<String>,
         payload: Bytes,
     },
-    Unknown(String),
 }
 
 #[derive(Clone, Debug)]
@@ -130,125 +131,96 @@ impl Connection {
     }
 
     pub fn parse_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
-        if !self.buffer.remaining() < 5 {
-            return Ok(None);
-        }
+        if self.buffer.starts_with(b"MSG ") {
+            if let Some(len) = self.buffer.find(b"\r\n") {
+                let line = std::str::from_utf8(&self.buffer[4..len]).unwrap();
+                let args = line.split(' ').filter(|s| !s.is_empty());
+                // TODO we can drop this alloc
+                let args = args.collect::<Vec<_>>();
 
-        fn get_line(buf: &'_ [u8]) -> Option<&'_ [u8]> {
-            for i in 0..buf.len() {
-                if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-                    return Some(&buf[0..i + 2]);
+                // Parse the operation syntax: MSG <subject> <sid> [reply-to] <#bytes>
+                let (subject, sid, reply_to, payload_len) = match args[..] {
+                    [subject, sid, payload_len] => (subject, sid, None, payload_len),
+                    [subject, sid, reply_to, payload_len] => {
+                        (subject, sid, Some(reply_to), payload_len)
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid number of arguments after MSG",
+                        ));
+                    }
+                };
+
+                let sid = u64::from_str(sid).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cannot parse sid argument after MSG",
+                    )
+                })?;
+
+                // Parse the number of payload bytes.
+                let payload_len = usize::from_str(payload_len).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cannot parse the number of bytes argument after MSG",
+                    )
+                })?;
+
+                if len + payload_len + 4 <= self.buffer.remaining() {
+                    let subject = subject.to_owned();
+                    let reply_to = reply_to.map(String::from);
+
+                    self.buffer.advance(len + 2);
+                    let payload = self.buffer.split_to(payload_len).freeze();
+                    self.buffer.advance(2);
+
+                    return Ok(Some(ServerOp::Message {
+                        sid,
+                        reply_to,
+                        subject,
+                        payload,
+                    }));
                 }
             }
 
-            None
-        }
-
-        let line = std::str::from_utf8(get_line(&self.buffer[..]).unwrap_or(&[])).unwrap();
-        let line_len = line.len();
-
-        let op = line
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-
-        if op.is_empty() {
-            self.buffer.advance(line_len);
             return Ok(None);
         }
 
-        if op == "PING" {
-            self.buffer.advance(line_len);
+        if self.buffer.starts_with(b"+OK\r\n") {
+            self.buffer.advance(5);
+            return Ok(Some(ServerOp::Ok));
+        }
+
+        if self.buffer.starts_with(b"PING\r\n") {
+            self.buffer.advance(6);
 
             return Ok(Some(ServerOp::Ping));
         }
 
-        if op == "PONG" {
-            self.buffer.advance(line_len);
+        if self.buffer.starts_with(b"PONG\r\n") {
+            self.buffer.advance(6);
 
             return Ok(Some(ServerOp::Pong));
         }
 
-        if op == "INFO" {
-            // Parse the JSON-formatted server information.
-            let server_info = ServerInfo::parse(&line[op.len()..]).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "cannot parse server info")
-            })?;
+        if self.buffer.starts_with(b"INFO ") {
+            if let Some(len) = self.buffer.find(b"\r\n") {
+                let line = std::str::from_utf8(&self.buffer[5..len]).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "cannot convert server info")
+                })?;
 
-            self.buffer.advance(line_len);
+                let server_info = ServerInfo::parse(line).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "cannot parse server info")
+                })?;
 
-            return Ok(Some(ServerOp::Info(server_info)));
-        }
+                self.buffer.advance(len + 2);
 
-        if op == "MSG" {
-            // Extract whitespace-delimited arguments that come after "MSG".
-            let args = line[op.len()..]
-                .split_whitespace()
-                .filter(|s| !s.is_empty());
-            let args = args.collect::<Vec<_>>();
-
-            // Parse the operation syntax: MSG <subject> <sid> [reply-to] <#bytes>
-            let (subject, sid, reply_to, payload_len) = match args[..] {
-                [subject, sid, payload_len] => (subject, sid, None, payload_len),
-                [subject, sid, reply_to, payload_len] => {
-                    (subject, sid, Some(reply_to), payload_len)
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid number of arguments after MSG",
-                    ));
-                }
-            };
-
-            // Parse the number of payload bytes.
-            let payload_len = usize::from_str(payload_len).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot parse the number of bytes argument after MSG",
-                )
-            })?;
-
-            // Return early if there is not enough remaining bytes to get the payload.
-            if self.buffer.remaining() < line_len + payload_len + 2 {
-                return Ok(None);
+                return Ok(Some(ServerOp::Info(server_info)));
             }
 
-            // Convert the slice into an owned string.
-            let subject = subject.to_owned();
-
-            // Parse the subject ID.
-            let sid = u64::from_str(sid).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot parse sid argument after MSG",
-                )
-            })?;
-
-            // Convert the slice into an owned string.
-            let reply_to = reply_to.map(String::from);
-
-            // Advance the cursor to the start of the payload.
-            self.buffer.advance(line_len);
-
-            // Read the payload.
-            // Note that this is done last to avoid a double borrow.
-            let payload = self.buffer.split_to(payload_len).freeze();
-
-            // Advance past the final "\r\n".
-            self.buffer.advance(2);
-
-            return Ok(Some(ServerOp::Message {
-                subject: subject.to_owned(),
-                sid,
-                reply_to,
-                payload,
-            }));
+            return Ok(None);
         }
-
-        // Unknown
-        self.buffer.advance(line_len);
 
         Ok(None)
     }
